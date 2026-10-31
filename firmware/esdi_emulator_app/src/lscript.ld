@@ -318,7 +318,7 @@ _SDA2_BASE_ = __sdata2_start + ((__sbss2_end - __sdata2_start) / 2 );
    . += _EL0_STACK_SIZE;
    . = ALIGN(64);
    __el0_stack = .;
-} > psu_ddr_0_MEM_0
+} > psu_ocm_ram_0_MEM_0
 
 _end = .;
 
@@ -329,6 +329,10 @@ _end = .;
 .ddr_memory (NOLOAD) : {
 	*(.ddr_memory)
 } > psu_ddr_0_MEM_0
+
+.ocm_memory (NOLOAD) : {
+	*(.ocm_memory)
+} > psu_ocm_ram_0_MEM_0
 
 }
 

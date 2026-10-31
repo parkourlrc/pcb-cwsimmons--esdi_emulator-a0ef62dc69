@@ -36,9 +36,10 @@
 #define DMA_LEAD 1		// The number of read DMA (mm2s) descriptors
 						// that we let the DMA lead the head position by
 #define MAX_SUPPORTED_CYLINDERS		1224
+#define MAX_SUPPORTED_HEADS			16
 #define MAX_SUPPORTED_SECTORS		96
-#define WORST_CASE_NUM_SLOTS		100
-#define DATA_BUFFER_SIZE			(1024 * WORST_CASE_NUM_SLOTS * 16 * MAX_SUPPORTED_SECTORS)
+#define NUM_SLOTS					1224
+#define DATA_BUFFER_SIZE			(1024 * NUM_SLOTS * MAX_SUPPORTED_HEADS * MAX_SUPPORTED_SECTORS)
 #define NUM_WRITE_DESCRIPTORS 		8
 #define DIRTY_QUEUE_SIZE 			1024
 #define PRELOAD_CYLINDERS			100
@@ -103,14 +104,13 @@ int last_unacked_write_descriptor;		// Index of the write descriptor we expect t
 
 // Storage for emulated sector data
 uint8_t buffers[DATA_BUFFER_SIZE] __attribute__((section(".ddr_memory"),aligned(EMULATION_FILE_ALIGNMENT))); // AXI DMA requires alignment of at least 4
-bool dirty_flags[WORST_CASE_NUM_SLOTS * 16 * MAX_SUPPORTED_SECTORS];
+bool dirty_flags[NUM_SLOTS * MAX_SUPPORTED_HEADS * MAX_SUPPORTED_SECTORS];
 
 // The data in 'buffers' is divided into slots, each slot holds a cylinder.
 // This array holds the mapping from cylinder to slot number
-int num_slots;
-int8_t cylinder_map[MAX_SUPPORTED_CYLINDERS];			// For converting cylinder# to slot#
-int slot_to_cylinder_map[WORST_CASE_NUM_SLOTS];
-uint64_t lru_table[WORST_CASE_NUM_SLOTS];
+int16_t cylinder_map[MAX_SUPPORTED_CYLINDERS] __attribute__((section(".ocm_memory")));			// For converting cylinder# to slot#
+int slot_to_cylinder_map[NUM_SLOTS] __attribute__((section(".ocm_memory")));
+uint64_t lru_table[NUM_SLOTS] __attribute__((section(".ocm_memory")));
 
 // Current state as driven by the controller
 int current_drive_sel = 0;
@@ -623,11 +623,6 @@ int main() {
 		return 0;
 	}
 
-	// num_slots = DATA_BUFFER_SIZE / cylinder_size;
-	num_slots = WORST_CASE_NUM_SLOTS;
-
-	printf("Number of slots: %d\r\n", num_slots);
-
 	// Load Initial cylinders
 	fr_seek = f_lseek(&image_file, emu_header.data_offset);
 
@@ -635,23 +630,28 @@ int main() {
 		return 0;
 	}
 
+	int cylinders_to_preload = (emu_header.cylinders > PRELOAD_CYLINDERS) ? PRELOAD_CYLINDERS : emu_header.cylinders;
     for (int i = 0; i < MAX_SUPPORTED_CYLINDERS; i++) {
-    	if (i < PRELOAD_CYLINDERS)
+    	if (i < cylinders_to_preload)
     		cylinder_map[i] = i;
     	else
     		cylinder_map[i] = -1;
     }
 
-	for (int i = 0; i < PRELOAD_CYLINDERS; i++) {
-		fr_read = f_read(&image_file, (void*) &buffers[cylinder_size * i], cylinder_size, &bytes_read);
-		if (fr_read || (bytes_read < cylinder_size)) {
-			xil_printf("Failed to load cylinder %d\r\n", i);
+	for (int i = 0; i < NUM_SLOTS; i++) {
+		if (i < cylinders_to_preload) {
+			fr_read = f_read(&image_file, (void*) &buffers[cylinder_size * i], cylinder_size, &bytes_read);
+			if (fr_read || (bytes_read < cylinder_size)) {
+				xil_printf("Failed to load cylinder %d\r\n", i);
+			}
+			slot_to_cylinder_map[i] = i;
+		} else {
+			slot_to_cylinder_map[i] = -1;
 		}
-		slot_to_cylinder_map[i] = i;
 	}
 
-	memset(dirty_flags, 0, WORST_CASE_NUM_SLOTS * 16 * MAX_SUPPORTED_SECTORS);
-	memset(lru_table, 0, WORST_CASE_NUM_SLOTS * sizeof(uint64_t));
+	memset(dirty_flags, 0, NUM_SLOTS * MAX_SUPPORTED_HEADS * MAX_SUPPORTED_SECTORS);
+	memset(lru_table, 0, NUM_SLOTS * sizeof(uint64_t));
 
 	xil_printf("Loaded Data\r\n");
 
@@ -762,19 +762,25 @@ int main() {
 			int lru_slot = 0;
 			uint64_t lru_timestamp = lru_table[0];
 
-			for (int i = 1; i < num_slots; i++) {
-				if (lru_table[i] < lru_timestamp) {
+			for (int i = 1; i < NUM_SLOTS; i++) {
+				if (slot_to_cylinder_map[i] == -1) {
+					lru_slot = i;
+					break;
+				}
+				if (lru_table[i] <= lru_timestamp) {
 					lru_slot = i;
 					lru_timestamp = lru_table[i];
 				}
 			}
 
-			// Determine if this slot has dirty sectors
+			// Determine if this slot has dirty sectors (if there's a cylinder loaded into it)
 			bool slot_dirty = false;
-			int dirty_flag_offset = lru_slot * emu_header.heads * emu_header.sectors_per_track;
-			for (int i = 0; i < (emu_header.heads * emu_header.sectors_per_track); i++) {
-				if (dirty_flags[dirty_flag_offset + i])
-					slot_dirty = true;
+			if (slot_to_cylinder_map[lru_slot] != -1) {
+				int dirty_flag_offset = lru_slot * emu_header.heads * emu_header.sectors_per_track;
+				for (int i = 0; i < (emu_header.heads * emu_header.sectors_per_track); i++) {
+					if (dirty_flags[dirty_flag_offset + i])
+						slot_dirty = true;
+				}
 			}
 
 			// If clean, evict and load with current_cylinder
@@ -790,7 +796,8 @@ int main() {
 
 				// Update maps
 				int cylinder_unloaded = slot_to_cylinder_map[lru_slot];		// backup cylinder# that is being unloaded
-				cylinder_map[cylinder_unloaded] = -1;						// mark that cylinder as unloaded
+				if (cylinder_unloaded != -1)
+					cylinder_map[cylinder_unloaded] = -1;						// mark that cylinder as unloaded
 				cylinder_map[current_cylinder] = lru_slot;
 				slot_to_cylinder_map[lru_slot] = current_cylinder;			
 
