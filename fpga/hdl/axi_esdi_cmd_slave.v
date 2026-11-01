@@ -82,6 +82,7 @@ module axi_esdi_cmd_controller #(
     wire interface_enable = control_register[1];
     wire drive_selected = control_register[2];
     wire drive_ready = control_register[3];
+    wire interrupt_enable = control_register[4];
 
     reg buffered_data_out_valid;
     reg [31:0] buffered_data_out;
@@ -101,6 +102,7 @@ module axi_esdi_cmd_controller #(
     reg command_complete;
     reg command_pending;
     reg attention;
+    reg interrupt_pending;
 
     reg [2:0] esdi_transfer_req_shift;
     reg [2:0] esdi_command_data_shift;
@@ -113,7 +115,7 @@ module axi_esdi_cmd_controller #(
     assign esdi_ready = drive_ready && drive_selected;
     assign esdi_drive_selected = drive_selected;
 
-    assign interrupt = command_pending;
+    assign interrupt = interrupt_pending && interrupt_enable;
 
     always @(posedge csr_aclk)
     begin
@@ -121,6 +123,7 @@ module axi_esdi_cmd_controller #(
         begin
            
             control_register <= 0;
+            interrupt_pending <= 0;
 
             transfer_ack <= 0;
             confstat_data <= 0;
@@ -131,7 +134,6 @@ module axi_esdi_cmd_controller #(
             state <= 0;
             bit_count <= 0;
             sending <= 0;
-
 
             buffered_data_out_valid <= 0;
             buffered_data_in_valid <= 0;
@@ -214,6 +216,7 @@ module axi_esdi_cmd_controller #(
                             buffered_data_in_valid <= 1;
                             buffered_data_in <= {15'h0, (~^data_in[16:1] != data_in[0]), data_in[16:1]};
                             command_pending <= 1;
+                            interrupt_pending <= 1;
                             state <= 3;
                         end
                         else
@@ -278,6 +281,7 @@ module axi_esdi_cmd_controller #(
 
             if (soft_reset)
             begin
+                interrupt_pending <= 0;
                 attention <= 0;
                 command_pending <= 0;
                 buffered_data_out_valid <= 0;
@@ -316,7 +320,11 @@ module axi_esdi_cmd_controller #(
                         buffered_data_out_valid <= 1;
                         buffered_data_out <= write_data;
                     end
-                    3 : if (write_data[0] == 0) command_pending <= 0;   // command_pending can only be cleared by software, not set
+                    3 : begin
+                        if (write_data[0] == 0)
+                            command_pending <= 0;   // command_pending can only be cleared by software, not set
+                        interrupt_pending <= write_data[1];
+                    end
                     4 : attention <= write_data[0];
                 endcase
 
@@ -334,7 +342,7 @@ module axi_esdi_cmd_controller #(
                         csr_rdata <= buffered_data_in;
                         buffered_data_in_valid <= 0;
                     end
-                    3 : csr_rdata <= {31'h0, command_pending};
+                    3 : csr_rdata <= {30'h0, interrupt_pending, command_pending};
                     4 : csr_rdata <= {31'h0, attention};
                 endcase
 

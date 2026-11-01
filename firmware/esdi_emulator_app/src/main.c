@@ -205,8 +205,8 @@ int dirty_queue_num_free() {
 
 // Handle for commands and configuration/status queries from the ESDI controller
 void command_interrupt_handler(void* arg) {
-	// Check that there is actually a command pending
-    if ((command_interface[1] & 0x2)) {
+	// Check that there is actually an interrupt pending and data to read
+    if ((command_interface[3] & 0x2) && (command_interface[1] & 0x2)) {
         uint32_t command = command_interface[2];
 
         uint32_t cmd = (command >> 12) & 0xf;
@@ -241,6 +241,8 @@ void command_interrupt_handler(void* arg) {
 			if (!seeks_throttled && !cyl_load_needed) {
 				command_interface[3] = 0;
 				lru_table[cylinder_map[current_cylinder]] = read_cntvct();
+			} else {
+				command_interface[3] = 0x1;	// Clear interrupt but not command pending
 			}
 
         } else if (cmd == 0x1) {	// recalibrate
@@ -262,7 +264,9 @@ void command_interrupt_handler(void* arg) {
 				command_interface[4] = 0;	// Clear the attention signal
         	}
         	command_interface[3] = 0;	// Clear the command pending bit
-        }
+        } else {
+			command_interface[3] = 0;	// Unhandled command
+		}
 
         // struct log_entry e;
 		// e.type = LOG_CMD;
@@ -280,7 +284,7 @@ void drive_sel_interrupt_handler(void* arg) {
         if (new_dsel != current_drive_sel) {
             current_drive_sel = new_dsel;
             if (new_dsel == 2) {
-                command_interface[0] = 0xE;		// Enable interface
+                command_interface[0] = 0x1E;		// Enable interface
             } else {
                 command_interface[0] = 0x0;		// Disable interface
             }
@@ -800,7 +804,7 @@ int main() {
 
 				// If there are no other barriers to completing the seek
 				if (!cyl_load_needed) {
-					command_interface[3] = 0;
+					command_interface[3] = 0;		// Race condition not posssible, since command processing stalls 
 					lru_table[cylinder_map[current_cylinder]] = read_cntvct();
 				}
 			}
