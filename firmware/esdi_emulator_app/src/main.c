@@ -31,6 +31,7 @@
 #include "sleep.h"
 #include "xil_mmu.h"
 #include "xil_cache.h"
+#include "xsdps.h"
 
 #define HW_FREQ			300000000
 #define DMA_LEAD 1		// The number of read DMA (mm2s) descriptors
@@ -44,6 +45,15 @@
 #define DIRTY_QUEUE_SIZE 			1024
 #define PRELOAD_CYLINDERS			100
 #define LOG_ENTRIES					100
+
+/* CCI-400 Registers */
+#define CCI_STATUS					(XPAR_PSU_CCI_GPV_S_AXI_BASEADDR + 0x000C)
+#define CCI_SNOOP_CTRL_S3			(XPAR_PSU_CCI_GPV_S_AXI_BASEADDR + 0x4000)
+
+/* IOU Secure SLCR Registers */
+#define IOU_AXI_WPRTCN				0xFF240000
+#define IOU_AXI_RPRTCN				0xFF240004
+#define IOU_AXI_PRTCN_SD1_NONSECURE	(1U << 20)		// AxPROT[1] of the SD1 field (bits 21:19)
 
 /* ESDI Emulation File Definition */
 
@@ -83,6 +93,7 @@ static XGpio head_gpio_inst;
 XScuGic interrupt_controller;
 static XScuGic_Config *GicConfig;
 static FATFS fatfs;
+static FIL image_file;		// Not on the stack: the stack is in OCM and the FIL's sector buffer is an SD DMA target
 
 /* Memory Mapped Hardware Registers */
 volatile uint32_t* command_interface = (volatile uint32_t*) XPAR_AXI_ESDI_CMD_CONTROL_0_BASEADDR;
@@ -509,13 +520,30 @@ void sector_timer_interrupt_handler(void* arg) {
 int main() {
 
 	// Enable HW Cache Coherence for memory areas for use by DMA
-	Xil_Out32(0xFD6E4000, 0x1);
+	// The APU is on CCI-400 slave interface S3 (ACE). Enabling snoops on S3 lets the CCI snoop
+	// the APU caches on behalf of any coherent ACE-Lite master, i.e. both the AXI DMA (via HPC0)
+	// and SD1 (routed to the CCI by psu_init via IOU_INTERCONNECT_ROUTE). ACE-Lite ports cannot
+	// be snooped, so their own snoop control registers do not need to be set.
+	Xil_Out32(CCI_SNOOP_CTRL_S3, Xil_In32(CCI_SNOOP_CTRL_S3) | 0x1);
+	while (Xil_In32(CCI_STATUS) & 0x1) {}	// Wait for change_pending to clear
 
-	uint32_t section = ((UINTPTR) buffers) / 0x100000U;
-	while (((uint32_t) (intptr_t) &buffers[DATA_BUFFER_SIZE - 1]) >= (section * 0x100000U)) {
-		Xil_SetTlbAttributes((UINTPTR) (section * 0x100000U), 0x605UL);
-		section += 1;
+	// psu_init configures SD1 as a non-secure master (AxPROT[1] = 1). We run at EL3 with secure
+	// mappings, so our cache lines are tagged secure and non-secure snoops from SD1 never hit them.
+	// Make SD1's DMA secure (AxPROT[1] = 0) so it is coherent with the APU caches, like the AXI DMA.
+	Xil_Out32(IOU_AXI_WPRTCN, Xil_In32(IOU_AXI_WPRTCN) & ~IOU_AXI_PRTCN_SD1_NONSECURE);
+	Xil_Out32(IOU_AXI_RPRTCN, Xil_In32(IOU_AXI_RPRTCN) & ~IOU_AXI_PRTCN_SD1_NONSECURE);
+
+	// The CCI only snoops for outer shareable memory, but the BSP's translation table maps DDR as
+	// inner shareable when running at EL3. Remap all of DDR (2MB blocks) as normal write-back outer
+	// shareable, not just 'buffers', since the SD driver and FatFs also DMA to/from their own
+	// structures (ADMA descriptor table, sector windows) and no longer flush/invalidate them.
+	for (UINTPTR block = XPAR_PSU_DDR_0_S_AXI_BASEADDR; block < XPAR_PSU_DDR_0_S_AXI_HIGHADDR; block += 0x200000U) {
+		Xil_SetTlbAttributes(block, 0x605UL);
 	}
+
+	// Same for the 2MB block holding OCM, because the stack lives there and the SD driver DMAs
+	// card registers (SCR, switch status) into local arrays during card initialization
+	Xil_SetTlbAttributes(XPAR_PSU_OCM_RAM_0_S_AXI_BASEADDR & ~(0x200000U - 1), 0x605UL);
 
 	dsb();
 
@@ -568,15 +596,34 @@ int main() {
 
     // Load Image from SD Card
 
-    f_mount(&fatfs, "0:/", 1);
+    // diskio.c copies this config table entry into its (static) SD driver instance during f_mount,
+    // so it can be overridden here to A/B test hardware coherency without rebuilding the BSP
+    XSdPs_Config *sd_config = XSdPs_LookupConfig(XPAR_XSDPS_0_DEVICE_ID);
+#ifdef SD_FORCE_NONCOHERENT
+    if (sd_config != NULL)
+    	sd_config->IsCacheCoherent = 0;
+#endif
+#ifdef SD_ROUTE_DIRECT
+    Xil_Out32(0xFF180408, Xil_In32(0xFF180408) & ~0x20U);	// Route SD1 DMA straight to DDR, bypassing the CCI
+#endif
+    if (sd_config != NULL)
+    	xil_printf("SD IsCacheCoherent = %d\r\n", sd_config->IsCacheCoherent);
 
-    FIL image_file;
-    FRESULT image_opened, fr_seek, fr_read, fr_write;
+    xil_printf("IOU_COHERENT_CTRL = 0x%08x, IOU_INTERCONNECT_ROUTE = 0x%08x, CCI S3 snoop = 0x%08x\r\n",
+    		Xil_In32(0xFF180400), Xil_In32(0xFF180408), Xil_In32(CCI_SNOOP_CTRL_S3));
+    xil_printf("IOU_AXI_WPRTCN = 0x%08x, IOU_AXI_RPRTCN = 0x%08x\r\n",
+    		Xil_In32(IOU_AXI_WPRTCN), Xil_In32(IOU_AXI_RPRTCN));
+
+    FRESULT fr_mount, image_opened, fr_seek, fr_read, fr_write;
     UINT bytes_read;
+
+    fr_mount = f_mount(&fatfs, "0:/", 1);
+    xil_printf("f_mount = %d\r\n", fr_mount);
 
     image_opened = f_open(&image_file, "PS2_2.EMU", FA_READ | FA_WRITE);
 
     if (image_opened != FR_OK) {
+    	xil_printf("Failed to open emulation file (FRESULT = %d)\r\n", image_opened);
     	return 0;
     }
 
@@ -584,6 +631,7 @@ int main() {
     fr_read = f_read(&image_file, (void*) &emu_header, sizeof(struct emulation_header), &bytes_read);
 
     if (bytes_read != sizeof(struct emulation_header)) {
+		xil_printf("Failed to read header\r\n");
     	return 0;
     }
 
@@ -591,12 +639,14 @@ int main() {
     fr_seek = f_lseek(&image_file, emu_header.drive_configuration_offset);
 
     if (fr_seek) {
+		xil_printf("Bad file size\r\n");
     	return 0;
     }
 
     fr_read = f_read(&image_file, (void*) &drive_conf, sizeof(struct drive_configuration), &bytes_read);
 
 	if (bytes_read != sizeof(struct drive_configuration)) {
+		xil_printf("Failed to read header2\r\n");
 		return 0;
 	}
 
@@ -627,6 +677,7 @@ int main() {
 	fr_seek = f_lseek(&image_file, emu_header.data_offset);
 
 	if (fr_seek) {
+		xil_printf("Bad file size2\r\n");
 		return 0;
 	}
 
@@ -863,17 +914,17 @@ int main() {
     		struct log_entry e = log[log_oldest];
     		log_oldest = (log_oldest + 1) % LOG_ENTRIES;
 
-    		// if (e.type == LOG_WRITE_MISSED) {
-    		// 	printf("Write missed (%d)\r\n", e.description[0]);
-    		// } else if (e.type == LOG_WRITE_OVERFLOW) {
-    		// 	printf("Write FIFO overflow (%d)\r\n", e.description[0]);
-    		// } else if (e.type == LOG_READ_MISSED) {
-    		// 	printf("Read deadline missed (%d, %d)\r\n", e.description[0], e.description[1]);
-    		// } else if (e.type == LOG_READ_UNDERFLOW) {
-    		// 	printf("Read underflow (%d)\r\n", e.description[0]);
-    		// } else if (e.type == LOG_DIRTY_FULL) {
-    		// 	printf("Dirty queue full (%d,%d,%d)\r\n", e.description[0], e.description[1], e.description[2]);
-    		// }
+    		if (e.type == LOG_WRITE_MISSED) {
+    			printf("Write missed (%d)\r\n", e.description[0]);
+    		} else if (e.type == LOG_WRITE_OVERFLOW) {
+    			printf("Write FIFO overflow (%d)\r\n", e.description[0]);
+    		} else if (e.type == LOG_READ_MISSED) {
+    			printf("Read deadline missed (%d, %d)\r\n", e.description[0], e.description[1]);
+    		} else if (e.type == LOG_READ_UNDERFLOW) {
+    			printf("Read underflow (%d)\r\n", e.description[0]);
+    		} else if (e.type == LOG_DIRTY_FULL) {
+    			printf("Dirty queue full (%d,%d,%d)\r\n", e.description[0], e.description[1], e.description[2]);
+    		}
 			// else if (e.type == LOG_CMD) {
     		// 	printf("Serial command (%x)\r\n", e.description[0]);
     		// }
